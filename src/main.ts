@@ -91,6 +91,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <textarea id="transcript-input" class="transcript-input" rows="5" placeholder="Type or paste a line, then Submit…"></textarea>
           <div class="row">
             <button type="button" id="btn-submit" class="btn primary">Submit</button>
+            <button type="button" id="btn-clear-transcript" class="btn secondary" aria-label="Clear mock transcript text">Clear</button>
             <button type="button" id="demo-a" class="btn">Demo: standup</button>
             <button type="button" id="demo-b" class="btn">Demo: questions</button>
             <button type="button" id="demo-c" class="btn">Demo: tech</button>
@@ -273,6 +274,11 @@ async function boot() {
   el('#demo-a').addEventListener('click', () => loadDemo(DEMO_A))
   el('#demo-b').addEventListener('click', () => loadDemo(DEMO_B))
   el('#demo-c').addEventListener('click', () => loadDemo(DEMO_C))
+
+  el('#btn-clear-transcript').addEventListener('click', () => {
+    transcriptInput.value = ''
+    transcriptInput.focus()
+  })
 
   el('#btn-missed').addEventListener('click', () => {
     renderMissed()
