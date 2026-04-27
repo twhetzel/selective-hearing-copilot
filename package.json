@@ -7,14 +7,18 @@
     "dev": "vite --host",
     "build": "tsc && vite build",
     "preview": "vite preview --host",
-    "qr": "evenhub qr"
+    "qr": "evenhub qr",
+    "stt-proxy": "node server/gcp-stt-proxy.mjs"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.13",
+    "@types/ws": "^8.18.1",
     "typescript": "~6.0.2",
     "vite": "^8.0.10"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "^0.0.10"
+    "@evenrealities/even_hub_sdk": "^0.0.10",
+    "@google-cloud/speech": "^7.3.0",
+    "ws": "^8.20.0"
   }
 }

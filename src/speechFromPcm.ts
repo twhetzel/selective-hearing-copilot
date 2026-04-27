@@ -1,98 +1,3 @@
-import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
-
-export interface PcmSpeechStubOptions {
-  rmsThreshold?: number
-  emitIntervalMs?: number
-  onStatus?: (msg: string) => void
-  onLog?: (msg: string, data?: unknown) => void
-}
-
-/** Demo lines that exercise vocative + questions + other cues (hackathon stub). */
-const STUB_TRANSCRIPT_ROTATION = [
-  'Trish - are you ready for the review?',
-  'Can you send the deck by 5 PM Friday?',
-  'We need to follow up on the OAuth rollout before EOD.',
-  'The API latency spike might be in the GRPC layer.',
-]
-
-function normalizePcm(raw: unknown): Uint8Array {
-  if (raw instanceof Uint8Array) return raw
-  if (raw instanceof ArrayBuffer) return new Uint8Array(raw)
-  if (Array.isArray(raw)) return new Uint8Array(raw as number[])
-  return new Uint8Array()
-}
-
-/** 16-bit little-endian mono PCM → RMS normalized ~[0,1]. */
-function pcmChunkRms(pcm: Uint8Array): number {
-  if (pcm.length < 2) return 0
-  const len = pcm.byteLength - (pcm.byteLength % 2)
-  const view = new DataView(pcm.buffer, pcm.byteOffset, len)
-  let sum = 0
-  const n = len / 2
-  for (let i = 0; i < len; i += 2) {
-    const s = view.getInt16(i, true)
-    sum += s * s
-  }
-  if (n === 0) return 0
-  return Math.sqrt(sum / n) / 32768
-}
-
-/**
- * Opens Even mic, listens for `audioEvent` PCM, and emits **stub** transcript lines when
- * voice activity (RMS) crosses threshold — swap `STUB_TRANSCRIPT_ROTATION` for real STT later.
- */
-export function attachPcmSpeechStub(
-  bridge: EvenAppBridge,
-  onTranscriptLine: (line: string) => void,
-  options: PcmSpeechStubOptions = {},
-): () => void {
-  const rmsThreshold = options.rmsThreshold ?? 0.025
-  const emitIntervalMs = options.emitIntervalMs ?? 3200
-  let lastEmit = 0
-  let stubIdx = 0
-  let micOpen = false
-
-  const openMic = async () => {
-    try {
-      await bridge.audioControl(true)
-      micOpen = true
-      options.onStatus?.('PCM → speech stub: mic on')
-      options.onLog?.('audioControl(true) ok')
-    } catch (e) {
-      options.onLog?.('audioControl failed', e)
-      options.onStatus?.('PCM stub: mic unavailable')
-    }
-  }
-
-  void openMic()
-
-  const unsub = bridge.onEvenHubEvent((event) => {
-    const rawPcm = event.audioEvent?.audioPcm
-    if (rawPcm == null) return
-    const pcm = normalizePcm(rawPcm as unknown)
-    if (pcm.length === 0) return
-
-    const rms = pcmChunkRms(pcm)
-    const now = Date.now()
-    if (rms < rmsThreshold || now - lastEmit < emitIntervalMs) return
-
-    lastEmit = now
-    const script = STUB_TRANSCRIPT_ROTATION[stubIdx % STUB_TRANSCRIPT_ROTATION.length]
-    stubIdx += 1
-    options.onLog?.('PCM stub VAD tick', { rms: Math.round(rms * 1000) / 1000, bytes: pcm.length })
-    onTranscriptLine(`[stub] ${script}`)
-  })
-
-  return () => {
-    unsub()
-    if (micOpen) {
-      void bridge.audioControl(false).catch(() => {
-        /* ignore */
-      })
-    }
-  }
-}
-
 /** Minimal typing for Web Speech in WebView (prefix varies by engine). */
 interface WebSpeechRecognition extends EventTarget {
   continuous: boolean
@@ -102,15 +7,64 @@ interface WebSpeechRecognition extends EventTarget {
   stop(): void
   onresult: ((this: WebSpeechRecognition, ev: SpeechRecognitionEvent) => void) | null
   onerror: ((this: WebSpeechRecognition, ev: SpeechRecognitionErrorEvent) => void) | null
+  onend: (() => void) | null
 }
 
 type SpeechRecognitionCtor = new () => WebSpeechRecognition
 
-/** Optional: browser Web Speech (phone mic) — not fed by Even PCM, but useful in WebView demos. */
-export function attachWebSpeechRecognition(
+export interface WebSpeechOptions {
+  /**
+   * Request mic with weaker echo-cancellation / AGC before Web Speech (default true).
+   * Best effort for “room” pickup on phone; still uses device mic in the WebView.
+   */
+  ambientRoom?: boolean
+}
+
+/**
+ * Prime mic access with constraints tuned for environmental pickup, then release.
+ * Triggers permission prompt; on some Android/Chrome builds this nudges input before Web Speech.
+ */
+async function primeAmbientListening(onStatus: (msg: string) => void): Promise<void> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    onStatus('Room: getUserMedia unavailable — using default mic for speech')
+    return
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        ...({
+          googEchoCancellation: false,
+          googNoiseSuppression: false,
+          googAutoGainControl: false,
+        } as Record<string, boolean>),
+      },
+    })
+    for (const track of stream.getTracks()) {
+      track.stop()
+    }
+    onStatus('Room: ambient mic profile set — starting speech…')
+  } catch (e) {
+    onStatus(`Room: could not use ambient mic (${String(e)}) — starting speech anyway`)
+  }
+}
+
+/**
+ * Phone / browser mic → Web Speech API. In the Even app WebView this is the practical way to get
+ * real text for classification and the HUD. (Glasses PCM is not wired to a cloud STT in this repo.)
+ */
+export async function attachWebSpeechRecognition(
   onFinalLine: (line: string) => void,
   onStatus: (msg: string) => void,
-): () => void {
+  options: WebSpeechOptions = {},
+): Promise<(() => void) | null> {
+  const ambient = options.ambientRoom !== false
+  if (ambient) {
+    await primeAmbientListening(onStatus)
+  }
+
   const W = window as Window & {
     SpeechRecognition?: SpeechRecognitionCtor
     webkitSpeechRecognition?: SpeechRecognitionCtor
@@ -118,7 +72,7 @@ export function attachWebSpeechRecognition(
   const R = W.SpeechRecognition ?? W.webkitSpeechRecognition
   if (!R) {
     onStatus('Web Speech API not available in this WebView')
-    return () => {}
+    return null
   }
 
   const rec = new R()
@@ -126,6 +80,8 @@ export function attachWebSpeechRecognition(
   rec.continuous = true
   rec.interimResults = false
   rec.lang = navigator.language || 'en-US'
+
+  let intentActive = true
 
   rec.onresult = (ev: SpeechRecognitionEvent) => {
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
@@ -136,22 +92,35 @@ export function attachWebSpeechRecognition(
   }
 
   rec.onerror = (ev: SpeechRecognitionErrorEvent) => {
+    if (ev.error === 'no-speech' || ev.error === 'aborted') return
     onStatus(`Web Speech: ${ev.error}`)
   }
 
-  try {
-    rec.start()
-    onStatus('Web Speech: listening (phone mic)')
-  } catch (e) {
-    onStatus(`Web Speech: could not start (${String(e)})`)
-    return () => {}
+  rec.onend = () => {
+    if (!intentActive) return
+    try {
+      rec.start()
+    } catch {
+      onStatus('Web Speech: session ended (could not restart)')
+    }
   }
 
-  return () => {
+  const stop = () => {
+    intentActive = false
     try {
       rec.stop()
     } catch {
       /* ignore */
     }
   }
+
+  try {
+    rec.start()
+    onStatus('Room: listening — HUD shows only cues that match your filters')
+  } catch (e) {
+    onStatus(`Web Speech: could not start (${String(e)})`)
+    return null
+  }
+
+  return stop
 }

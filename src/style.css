@@ -68,7 +68,7 @@ h2 {
   font-family: var(--mono);
 }
 
-.pcm-status {
+.speech-status {
   margin: 0.35rem 0 0;
   font-size: 0.8rem;
   color: var(--text-muted);

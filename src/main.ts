@@ -1,6 +1,6 @@
 import './style.css'
 import {
-  classifyLine,
+  classifyUtterance,
   defaultEnabledFilters,
   filterCues,
   formatHudLine,
@@ -8,12 +8,10 @@ import {
   type Cue,
   type CueType,
 } from './classifier.ts'
+import { attachGcpGlassesStt } from './glassesGcpStt.ts'
 import { attachGlassesTapHandlers } from './evenTapHandlers.ts'
 import { clearEvenHudSessionFlag, initEvenHud } from './evenHud.ts'
-import {
-  attachPcmSpeechStub,
-  attachWebSpeechRecognition,
-} from './speechFromPcm.ts'
+import { attachWebSpeechRecognition } from './speechFromPcm.ts'
 
 const BUFFER_MAX = 10
 const MISSED_LINES = 6
@@ -55,7 +53,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <h1 class="app-title">Selective Hearing Co-Pilot</h1>
       <p class="app-sub">Accessibility-first cues on G2 — only what you enable reaches the glasses.</p>
       <p id="bridge-status" class="bridge-status" role="status">Even bridge: …</p>
-      <p id="pcm-status" class="pcm-status" role="status">PCM / speech: …</p>
+      <p id="speech-status" class="speech-status" role="status">Live speech: …</p>
       <p class="hud-reset-row">
         <button type="button" id="btn-reset-hud-session" class="btn btn-small">Reset HUD session &amp; reload</button>
         <span class="live-hint">Use this if you see <code>invalid (1)</code> after a refresh, or glasses stay blank.</span>
@@ -81,8 +79,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         </fieldset>
 
         <div class="live-row">
-          <button type="button" id="btn-web-speech" class="btn">Phone mic (Web Speech)</button>
-          <span class="live-hint">PCM stub runs in Even app when bridge connects (VAD → demo lines). Web Speech uses the phone microphone in the WebView.</span>
+          <button type="button" id="btn-web-speech" class="btn">Start / stop live speech</button>
+          <span class="live-hint">With <code>VITE_GCP_STT_WS_URL</code> + <code>npm run stt-proxy</code>, glasses audio goes to Google STT <strong>and</strong> the phone mic still runs Web Speech for room pickup (both feed the transcript). HUD only shows enabled cue types.</span>
         </div>
 
         <div class="transcript-block">
@@ -109,7 +107,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
 const hudPreview = el('#hud-preview')
 const bridgeStatus = el('#bridge-status')
-const pcmStatus = el('#pcm-status')
+const speechStatus = el('#speech-status')
+const btnWebSpeech = el<HTMLButtonElement>('#btn-web-speech')
 const transcriptInput = el<HTMLTextAreaElement>('#transcript-input')
 const missedOutput = el('#missed-output')
 const checkboxes = document.querySelectorAll<HTMLInputElement>('input[name="cue"]')
@@ -117,6 +116,11 @@ const checkboxes = document.querySelectorAll<HTMLInputElement>('input[name="cue"
 let enabled = defaultEnabledFilters()
 let ring: string[] = []
 let lastSubmittedLine = ''
+/** True while Web Speech session is active (room listening mode). */
+let liveSpeechRunning = false
+
+const HUD_ROOM_IDLE = 'Room: listening…\n\nOnly cues matching your filters appear here.'
+const HUD_ROOM_NO_MATCH = 'Room: listening…\n\nNo selective cue in the last utterance.'
 
 let setHudTextRef: (text: string) => Promise<void> = async () => {}
 
@@ -148,14 +152,18 @@ function ingestTranscriptLine(raw: string) {
 
 async function refreshHud(setHudText: (t: string) => Promise<void>) {
   if (!lastSubmittedLine) {
-    await setHudText('Selective Hearing Co-Pilot\n\nSubmit a line to show a cue.')
+    await setHudText(
+      liveSpeechRunning
+        ? HUD_ROOM_IDLE
+        : 'Selective Hearing Co-Pilot\n\nSubmit a line to preview a cue.',
+    )
     return
   }
-  const all = classifyLine(lastSubmittedLine)
+  const all = classifyUtterance(lastSubmittedLine)
   const filtered = filterCues(all, enabled)
   const top = pickTopCue(filtered)
   if (!top) {
-    await setHudText('(No cue for this line with current filters.)')
+    await setHudText(liveSpeechRunning ? HUD_ROOM_NO_MATCH : '(No cue for this line with current filters.)')
     return
   }
   await setHudText(formatHudLine(top))
@@ -166,7 +174,7 @@ function buildMissedHudDigest(): string {
   if (lines.length === 0) return 'Missed: no recent lines yet.'
   const hidden: string[] = []
   for (const line of lines) {
-    for (const c of classifyLine(line)) {
+    for (const c of classifyUtterance(line)) {
       if (!enabled.has(c.type)) {
         hidden.push(`• ${CUE_LABELS[c.type]}: ${c.text}`)
       }
@@ -187,7 +195,7 @@ function renderMissed() {
 
   const hidden: Cue[] = []
   for (const line of lines) {
-    for (const c of classifyLine(line)) {
+    for (const c of classifyUtterance(line)) {
       if (!enabled.has(c.type)) hidden.push(c)
     }
   }
@@ -214,25 +222,91 @@ async function boot() {
   })
   setHudTextRef = setHudText
 
-  pcmStatus.textContent =
-    bridge
-      ? 'PCM / speech: ready (stub attaches below)'
-      : 'PCM / speech: bridge offline (desktop preview)'
+  speechStatus.textContent = bridge
+    ? 'Live speech: starting…'
+    : 'Live speech: off (Even bridge not connected — use the button to try the device mic)'
 
-  let detachPcm: (() => void) | undefined
   let detachTap: (() => void) | undefined
   let stopWebSpeech: (() => void) | null = null
+  let detachGlassesGcp: (() => void) | undefined
 
-  if (bridge) {
-    detachPcm = attachPcmSpeechStub(bridge, ingestTranscriptLine, {
+  const gcpSttWsUrl = import.meta.env.VITE_GCP_STT_WS_URL?.trim()
+  const sttSampleRateHz = Number(import.meta.env.VITE_STT_SAMPLE_RATE_HZ || 16000)
+  const sttLanguage =
+    import.meta.env.VITE_STT_LANGUAGE?.trim() || 'en-US'
+
+  const setSpeechRunningUi = (running: boolean) => {
+    btnWebSpeech.textContent = running ? 'Stop live speech' : 'Start live speech'
+  }
+
+  const startGlassesGcp = () => {
+    if (!bridge || !gcpSttWsUrl || detachGlassesGcp) return
+    detachGlassesGcp = attachGcpGlassesStt(bridge, {
+      wsUrl: gcpSttWsUrl,
+      sampleRateHertz: Number.isFinite(sttSampleRateHz) ? sttSampleRateHz : 16000,
+      languageCode: sttLanguage,
+      onFinalLine: (text) => {
+        ingestTranscriptLine(`[gcp] ${text}`)
+      },
       onStatus: (m) => {
-        pcmStatus.textContent = m
+        speechStatus.textContent = m
       },
       onLog: (msg, data) => {
-        console.info('[PCM stub]', msg, data ?? '')
+        console.info('[Glasses GCP STT]', msg, data ?? '')
       },
     })
+    liveSpeechRunning = true
+    setSpeechRunningUi(true)
+    void refreshHud(setHudText)
+  }
 
+  const startWebSpeechOnly = async () => {
+    if (stopWebSpeech) return
+    const detach = await attachWebSpeechRecognition(
+      ingestTranscriptLine,
+      (m) => {
+        speechStatus.textContent = m
+      },
+      { ambientRoom: true },
+    )
+    if (detach == null) {
+      if (!detachGlassesGcp) {
+        setSpeechRunningUi(false)
+        liveSpeechRunning = false
+      }
+      return
+    }
+    stopWebSpeech = detach
+    liveSpeechRunning = true
+    setSpeechRunningUi(true)
+    void refreshHud(setHudText)
+  }
+
+  const startLiveSpeech = async () => {
+    if (stopWebSpeech || detachGlassesGcp) return
+    if (bridge && gcpSttWsUrl) {
+      startGlassesGcp()
+      await startWebSpeechOnly()
+      return
+    }
+    await startWebSpeechOnly()
+  }
+
+  const stopLiveSpeech = () => {
+    detachGlassesGcp?.()
+    detachGlassesGcp = undefined
+    stopWebSpeech?.()
+    stopWebSpeech = null
+    liveSpeechRunning = false
+    setSpeechRunningUi(false)
+    speechStatus.textContent = bridge
+      ? 'Live speech: stopped (tap Start to resume)'
+      : 'Live speech: stopped'
+    void refreshHud(setHudText)
+  }
+
+  if (bridge) {
+    await startLiveSpeech()
     detachTap = attachGlassesTapHandlers(bridge, {
       onHudTapSingle: async () => {
         renderMissed()
@@ -249,6 +323,8 @@ async function boot() {
         await refreshHud(setHudText)
       },
     })
+  } else {
+    setSpeechRunningUi(false)
   }
 
   checkboxes.forEach((cb) => {
@@ -297,23 +373,17 @@ async function boot() {
     window.location.reload()
   })
 
-  el('#btn-web-speech').addEventListener('click', () => {
+  btnWebSpeech.addEventListener('click', () => {
     if (stopWebSpeech) {
-      stopWebSpeech()
-      stopWebSpeech = null
-      pcmStatus.textContent = bridge
-        ? 'Web Speech stopped. PCM stub still active if connected.'
-        : 'Web Speech stopped.'
-      return
+      stopLiveSpeech()
+    } else {
+      void startLiveSpeech()
     }
-    stopWebSpeech = attachWebSpeechRecognition(ingestTranscriptLine, (m) => {
-      pcmStatus.textContent = m
-    })
   })
 
   window.addEventListener('beforeunload', () => {
-    detachPcm?.()
     detachTap?.()
+    detachGlassesGcp?.()
     stopWebSpeech?.()
   })
 

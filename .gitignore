@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Google Cloud service account key (local only; paste real JSON from GCP console)
+selectivehearing-evenrealities-6d7f3fa2cc8f.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

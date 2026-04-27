@@ -80,12 +80,41 @@ Work through these in order; if step 1 fails, the QR / Even app is not the probl
 
    You should see a `node` (or `vite`) process. If nothing listens, the dev server is not up or uses another port (check the terminal for the actual port).
 
+## Glasses audio → Google Cloud Speech (optional)
+
+The WebView can forward **glasses PCM** from the Even bridge to a **small WebSocket proxy** on your laptop, which calls **Google Cloud Speech-to-Text (streaming)**. Service account JSON stays **only on the machine running the proxy**, not in the phone app.
+
+1. Enable **Speech-to-Text** in a GCP project and create a **service account** key JSON.
+2. On the laptop:
+
+   ```bash
+   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/your-service-account.json
+   npm run stt-proxy
+   ```
+
+   Default listen: `ws://0.0.0.0:8787` (override with `STT_PROXY_PORT`).
+
+3. Point the Vite app at the proxy (same LAN IP the phone uses for the dev server), e.g. in **`.env.local`**:
+
+   ```bash
+   VITE_GCP_STT_WS_URL=ws://YOUR_LAN_IP:8787
+   VITE_STT_SAMPLE_RATE_HZ=16000
+   VITE_STT_LANGUAGE=en-US
+   ```
+
+   Restart `npm run dev` after changing env vars. If `VITE_GCP_STT_WS_URL` is set and the Even bridge is connected, the app uses **glasses → GCP STT** and **also** keeps **Web Speech on the phone mic** so room speech still appears in the transcript alongside glasses text. If the GCP URL is unset, only Web Speech runs.
+
+Match **`VITE_STT_SAMPLE_RATE_HZ`** to the PCM format your Even host sends (often 16 kHz mono LINEAR16); wrong values produce poor recognition.
+
+**If the app shows “bridge audio on” then “connection closed”:** the phone’s WebSocket to the proxy failed. Use **`ws://YOUR_LAN_IP:8787`** (same IP as in the Vite QR URL), **not** `localhost` or `127.0.0.1` — from the phone, those point at the phone itself. Keep **`npm run stt-proxy`** running with valid **`GOOGLE_APPLICATION_CREDENTIALS`**, allow **TCP 8787** through the Mac firewall, and watch the proxy terminal for errors (Speech API auth, etc.).
+
 ## Other scripts
 
 | Command | Purpose |
 |--------|---------|
 | `npm run build` | Typecheck and production build to `dist` |
 | `npm run preview` | Serve the built app locally |
+| `npm run stt-proxy` | WebSocket proxy: glasses PCM → Google Cloud Speech streaming (`GOOGLE_APPLICATION_CREDENTIALS` required) |
 | `evenhub` / `eh` | After install, `npx evenhub --help` — login, init `app.json`, `pack` for distribution (see [Even Hub CLI](https://hub.evenrealities.com/docs/reference/cli)) |
 
 ## Further reading

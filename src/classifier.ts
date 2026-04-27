@@ -175,6 +175,40 @@ export function isVocativeDirectedQuestion(raw: string): boolean {
   return isQuestionShaped(v.rest, v.restLower)
 }
 
+/** Split ASR into clauses so mixed “room chatter + question” still yields cues. */
+function splitUtteranceChunks(t: string): string[] {
+  const trimmed = t.trim()
+  if (!trimmed) return []
+  const parts = trimmed
+    .split(/\n+|(?<=[.!?])\s+/u)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return parts.length > 0 ? parts : [trimmed]
+}
+
+/**
+ * Classify a longer transcript (multiple sentences/phrases). Keeps the best cue per type
+ * across chunks so room speech still surfaces dates, names, etc.
+ */
+export function classifyUtterance(text: string): Cue[] {
+  const trimmed = text.trim()
+  if (!trimmed) return []
+
+  const chunks = splitUtteranceChunks(trimmed)
+  const best = new Map<CueType, Cue>()
+
+  for (const ch of chunks) {
+    for (const c of classifyLine(ch)) {
+      const ex = best.get(c.type)
+      if (!ex || c.text.length > ex.text.length) {
+        best.set(c.type, c)
+      }
+    }
+  }
+
+  return CUE_PRIORITY.flatMap((ty) => (best.has(ty) ? [best.get(ty)!] : []))
+}
+
 export function classifyLine(line: string): Cue[] {
   const raw = line.trim()
   if (!raw) return []
